@@ -96,7 +96,7 @@ function MultiHeadAttention(num_heads; n_embedding, head_size, block_size)
     MultiHeadAttention(
         [Head(n_embedding, head_size, block_size) for _ in 1:num_heads],
         Dense(n_embedding => n_embedding),
-        LayerNorm((n_embedding,), dims=1),
+        LayerNorm((n_embedding, block_size), dims=1),
     )
 end
 
@@ -133,7 +133,7 @@ function Block(n_embedding, n_head, block_size)
     Block(
         MultiHeadAttention(n_head; n_embedding, head_size, block_size),
         Chain(
-            LayerNorm((n_embedding,), dims=1),
+            LayerNorm((n_embedding, block_size), dims=1),
             Dense(n_embedding => 4 * n_embedding, relu),
             Dense(4 * n_embedding => n_embedding),
         ),
@@ -162,7 +162,7 @@ BigramLanguageModel(n_embedding, vocabulary_size, block_size; n_head=4) = Bigram
         Block(n_embedding, n_head, block_size),
         Block(n_embedding, n_head, block_size),
         Block(n_embedding, n_head, block_size),
-        LayerNorm((n_embedding,), dims=1),
+        LayerNorm((n_embedding, block_size), dims=1),
     ),
     Dense(n_embedding, vocabulary_size),
 )
@@ -182,8 +182,6 @@ model = BigramLanguageModel(n_embd, vocab_size, block_size)
 ps, st = Lux.setup(rng, model)
 
 model(rand(rng, 1:vocab_size, block_size, batch_size), ps, st)
-
-# Note LayerNorm((n_embedding, block_size)) works, but seems like it is wrong. Can we do norm over only first dim? Try torch?
 
 function logitcrossentropy(ypred, ytrue; dims=1)
     return mean(.-sum(ytrue .* Lux.logsoftmax(ypred; dims=dims); dims=dims))
