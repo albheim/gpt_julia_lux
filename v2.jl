@@ -5,7 +5,10 @@ using Random, Statistics, Distributions, LinearAlgebra
 rng = Random.default_rng()
 Random.seed!(rng, 37)
 
-download("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", "input.txt")
+fpath = joinpath(@__DIR__, "input.txt")
+if !isfile(fpath)
+    download("https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt", fpath)
+end
 
 text = read("input.txt", String)
 
