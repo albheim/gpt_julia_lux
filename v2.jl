@@ -30,10 +30,16 @@ val_data = data[n+1:end]
 eval_iters = 200
 eval_interval = 500
 max_iters = 5000
-batch_size = 32
-block_size = 8
-n_embd = 32
-lr = 1e-3
+
+batch_size = 64
+block_size = 256
+n_embd = 384
+n_head = 6
+n_layer = 6
+
+lr = 3e-4
+dropout = 0.2
+
 
 function get_batch(rng, data; block_size, batch_size, vocab_size)
     ix = rand(rng, 1:length(data)-block_size, batch_size)
@@ -44,15 +50,32 @@ end
 
 xb, yb = get_batch(rng, train_data; batch_size, block_size, vocab_size)
 
+# Custom Layernorm since Lux one requires set size of non-batch dimensions (and we want to allow shorter)
+struct MyLayerNorm{T, D} <: Lux.AbstractNormalizationLayer{false, false}
+    epsilon::T
+    dims::D
+end
 
-struct Head{K,Q,V,M} <: Lux.AbstractExplicitContainerLayer{(:key_net, :query_net, :value_net)}
+MyLayerNorm(; dims, epsilon=1.0f-5) = MyLayerNorm(epsilon, dims)
+
+Lux.initialparameters(rng::AbstractRNG, ln::MyLayerNorm) = NamedTuple()
+Lux.initialstates(rng::AbstractRNG, ln::MyLayerNorm) = NamedTuple()
+
+function (l::MyLayerNorm)(x::AbstractArray, ps, st::NamedTuple)
+    _mean = mean(x; dims=l.dims)
+    _rstd = 1 ./ (std(x; dims=l.dims, mean=_mean, corrected=false) .+ l.epsilon)
+    (x .- _mean) .* _rstd, st
+end
+
+struct Head{K,Q,V,D,M} <: Lux.AbstractExplicitContainerLayer{(:key_net, :query_net, :value_net, :dropout)}
     key_net::K
     query_net::Q
     value_net::V
+    dropout::D
     triangular_matrix::M
 end
     
-function Head(n_embedding, head_size, block_size)
+function Head(n_embedding, head_size, block_size, dropout)
     mat = zeros(block_size, block_size)
     for i in axes(mat, 2)
         for j in i+1:size(mat, 1)
@@ -64,26 +87,30 @@ function Head(n_embedding, head_size, block_size)
         Dense(n_embedding => head_size),
         Dense(n_embedding => head_size),
         Dense(n_embedding => head_size),
+        Dropout(dropout),
         mat
     )
 end
 
 function (h::Head)(x::AbstractArray, ps, st::NamedTuple)
+    C, T, B = size(x)
+
     yk, sk = h.key_net(x, ps.key_net, st.key_net)
     yq, sq = h.query_net(x, ps.query_net, st.query_net)
     yv, sv = h.value_net(x, ps.value_net, st.value_net)
 
-    wei = batched_mul(permutedims(yk, (2, 1, 3)), yq) .* (size(x, 1)^-0.5)
+    wei = batched_mul(permutedims(yk, (2, 1, 3)), yq) .* sqrt(size(x, 1))
 
-    wei = wei .+ h.triangular_matrix
+    wei = wei .+ @view h.triangular_matrix[1:T, 1:T] # TODO this does not seem optimal?
     wei = softmax(wei, dims=1)
+    wei, sd = h.dropout(wei, ps.dropout, st.dropout)
 
     out = batched_mul(yv, wei)
 
-    return out, (key_net = sk, query_net = sq, value_net=sv)
+    return out, (key_net = sk, query_net = sq, value_net=sv, dropout=sd)
 end
 
-model = Head(n_embd, n_embd, block_size)
+model = Head(n_embd, n_embd, block_size, dropout)
 ps, st = Lux.setup(rng, model)
 
 y, st = model(randn(rng, n_embd, block_size, batch_size), ps, st)
@@ -95,11 +122,14 @@ struct MultiHeadAttention{H,D,L} <: Lux.AbstractExplicitLayer
     layer_norm::L
 end
 
-function MultiHeadAttention(num_heads; n_embedding, head_size, block_size)
+function MultiHeadAttention(num_heads, n_embedding, head_size, block_size, dropout)
     MultiHeadAttention(
-        [Head(n_embedding, head_size, block_size) for _ in 1:num_heads],
-        Dense(n_embedding => n_embedding),
-        LayerNorm((n_embedding, block_size), dims=1),
+        [Head(n_embedding, head_size, block_size, dropout) for _ in 1:num_heads],
+        Chain(
+            Dense(n_embedding => n_embedding),
+            Dropout(dropout),
+        ),
+        MyLayerNorm(dims=1),
     )
 end
 
@@ -131,14 +161,15 @@ struct Block{H,F} <: Lux.AbstractExplicitContainerLayer{(:sa_head, :feed_forward
     feed_forward::F
 end
 
-function Block(n_embedding, n_head, block_size)
+function Block(n_embedding, n_head, block_size, dropout)
     head_size = n_embedding ÷ n_head
     Block(
-        MultiHeadAttention(n_head; n_embedding, head_size, block_size),
+        MultiHeadAttention(n_head, n_embedding, head_size, block_size, dropout),
         Chain(
-            LayerNorm((n_embedding, block_size), dims=1),
+            MyLayerNorm(dims=1),
             Dense(n_embedding => 4 * n_embedding, relu),
             Dense(4 * n_embedding => n_embedding),
+            Dropout(dropout)
         ),
     )
 end
@@ -158,14 +189,12 @@ struct BigramLanguageModel{E1,E2,B,H} <: Lux.AbstractExplicitContainerLayer{(:to
     lm_head::H
 end
 
-BigramLanguageModel(n_embedding, vocabulary_size, block_size; n_head=4) = BigramLanguageModel(
+BigramLanguageModel(n_embedding, vocabulary_size, block_size, dropout, n_head, n_layer) = BigramLanguageModel(
     Embedding(vocabulary_size => n_embedding),
     Embedding(block_size => n_embedding),
     Chain(
-        Block(n_embedding, n_head, block_size),
-        Block(n_embedding, n_head, block_size),
-        Block(n_embedding, n_head, block_size),
-        LayerNorm((n_embedding, block_size), dims=1),
+        (Block(n_embedding, n_head, block_size, dropout) for _ in n_layer)...,
+        MyLayerNorm(dims=1),
     ),
     Dense(n_embedding, vocabulary_size),
 )
@@ -181,7 +210,7 @@ function (bl::BigramLanguageModel)(x::AbstractArray, ps, st::NamedTuple)
     return logits, (token_embedding=st_tok, position_embedding=st_pos, blocks=st_bk, lm_head=st_lm)
 end
 
-model = BigramLanguageModel(n_embd, vocab_size, block_size)
+model = BigramLanguageModel(n_embd, vocab_size, block_size, dropout, n_head, n_layer)
 ps, st = Lux.setup(rng, model)
 
 model(rand(rng, 1:vocab_size, block_size, batch_size), ps, st)
@@ -198,6 +227,7 @@ end
 compute_loss(xb, yb, model, ps, st)[1]
 
 function generate(rng, x, model, ps, st; new_tokens, block_size)
+    st = Lux.testmode(st)
     for _ in 1:new_tokens
         crop_len = min(block_size, size(x, 1))
         x_recent = @view x[end+1-crop_len:end, :]
@@ -209,7 +239,8 @@ function generate(rng, x, model, ps, st; new_tokens, block_size)
     x
 end
 
-generated = generate(rng, ones(Int, block_size, 1), model, ps, st; new_tokens=100, block_size)[:, 1]
+# TODO should probably allow being called with shorter x?
+generated = generate(rng, ones(Int, 1, 1), model, ps, st; new_tokens=100, block_size)[:, 1]
 decoded = decode(generated)
 
 opt = Optimisers.ADAMW(lr)
@@ -219,6 +250,7 @@ opt_state = Optimisers.setup(opt, ps)
 gs = back((one(loss), nothing, nothing))[1]
 
 function estimate_loss(rng, datas, model, ps, st; eval_iters, batch_size, block_size)
+    st = Lux.testmode(st)
     out = []
     for data in datas
         loss = 0.0
@@ -243,5 +275,5 @@ for epoch in 1:max_iters
 end
 
 
-decode(generate(rng, ones(Int, block_size, 1), model, ps, st; new_tokens=500, block_size)[:, 1])
+decode(generate(rng, ones(Int, 1, 1), model, ps, st; new_tokens=500, block_size)[:, 1])
 
