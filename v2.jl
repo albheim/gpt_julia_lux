@@ -101,7 +101,7 @@ function Lux.initialstates(rng::AbstractRNG, m::Head)
         end
     end
     return (; 
-        triangular_matrix=mat,
+        triangular_matrix=mat, # TODO this means that each head stores its own matrix, should be possible to share one between all?
         key_net=Lux.initialstates(rng, m.key_net),
         query_net=Lux.initialstates(rng, m.query_net),
         value_net=Lux.initialstates(rng, m.value_net),
@@ -114,19 +114,19 @@ Lux.statelength(m::Head) = m.block_size^2 + Lux.statelength(m.key_net) + Lux.sta
 function (h::Head)(x::AbstractArray, ps, st::NamedTuple)
     C, T, B = size(x)
 
-    yk, sk = h.key_net(x, ps.key_net, st.key_net)
-    yq, sq = h.query_net(x, ps.query_net, st.query_net)
-    yv, sv = h.value_net(x, ps.value_net, st.value_net)
+    yk, st_ke = h.key_net(x, ps.key_net, st.key_net)
+    yq, st_qu = h.query_net(x, ps.query_net, st.query_net)
+    yv, st_va = h.value_net(x, ps.value_net, st.value_net)
 
     wei = batched_mul(permutedims(yk, (2, 1, 3)), yq) .* sqrt(size(x, 1))
 
     wei = wei .+ @view st.triangular_matrix[1:T, 1:T] # TODO this does not seem optimal?
     wei = softmax(wei, dims=1)
-    wei, sd = h.dropout(wei, ps.dropout, st.dropout)
+    wei, st_dr = h.dropout(wei, ps.dropout, st.dropout)
 
     out = batched_mul(yv, wei)
 
-    return out, (key_net = sk, query_net = sq, value_net=sv, dropout=sd, triangular_matrix=st.triangular_matrix)
+    return out, (key_net = st_ke, query_net = st_qu, value_net=st_va, dropout=st_dr, triangular_matrix=st.triangular_matrix)
 end
 
 model = Head(n_embd, n_embd, block_size, dropout)
@@ -167,12 +167,14 @@ Lux.statelength(m::MultiHeadAttention) = length(m.heads) * Lux.statelength(m.hea
 
 function (m::MultiHeadAttention)(x::AbstractArray, ps, st::NamedTuple)
     in, st_ln = m.layer_norm(x, ps.layer_norm, st.layer_norm)
-    tmp = [m.heads[i](in, ps.multiheadparams[i], st.multiheadstates[i]) for i in eachindex(m.heads)]
-    out = reduce(vcat, map(x -> x[1], tmp))
-    out, st_pr = m.projection(out, ps.projection, st.projection)
-    newstates = collect(map(x -> x[2], tmp))
 
-    return out, (; multiheadstates=newstates, projection=st_pr, layer_norm=st_ln)
+    tmp = [m.heads[i](in, ps.multiheadparams[i], st.multiheadstates[i]) for i in eachindex(m.heads)]
+    out_mh = reduce(vcat, map(x -> x[1], tmp))
+    st_mh = collect(map(x -> x[2], tmp))
+
+    out, st_pr = m.projection(out_mh, ps.projection, st.projection)
+
+    return out, (; multiheadstates=st_mh, projection=st_pr, layer_norm=st_ln)
 end
 
 struct Block{H,F} <: Lux.AbstractExplicitContainerLayer{(:sa_head, :feed_forward)}
@@ -181,6 +183,7 @@ struct Block{H,F} <: Lux.AbstractExplicitContainerLayer{(:sa_head, :feed_forward
 end
 
 function Block(n_embedding, n_head, block_size, dropout)
+    @assert n_embedding % n_head == 0
     head_size = n_embedding ÷ n_head
     Block(
         MultiHeadAttention(n_head, n_embedding, head_size, block_size, dropout),
