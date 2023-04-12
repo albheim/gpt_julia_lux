@@ -67,30 +67,47 @@ function (l::MyLayerNorm)(x::AbstractArray, ps, st::NamedTuple)
     (x .- _mean) .* _rstd, st
 end
 
-struct Head{K,Q,V,D,M} <: Lux.AbstractExplicitContainerLayer{(:key_net, :query_net, :value_net, :dropout)}
+struct Head{K,Q,V,D} <: Lux.AbstractExplicitLayer
     key_net::K
     query_net::Q
     value_net::V
     dropout::D
-    triangular_matrix::M
+    block_size::Int
 end
     
 function Head(n_embedding, head_size, block_size, dropout)
-    mat = zeros(block_size, block_size)
-    for i in axes(mat, 2)
-        for j in i+1:size(mat, 1)
-            mat[j, i] = -Inf
-        end
-    end
-
     Head(
         Dense(n_embedding => head_size),
         Dense(n_embedding => head_size),
         Dense(n_embedding => head_size),
         Dropout(dropout),
-        mat
+        block_size,
     )
 end
+
+Lux.initialparameters(rng::AbstractRNG, m::Head) = (; 
+    key_net=Lux.initialparameters(rng, m.key_net),
+    query_net=Lux.initialparameters(rng, m.query_net),
+    value_net=Lux.initialparameters(rng, m.value_net),
+    dropout=Lux.initialparameters(rng, m.dropout),
+)
+function Lux.initialstates(rng::AbstractRNG, m::Head)
+    mat = zeros(m.block_size, m.block_size)
+    for i in axes(mat, 2)
+        for j in i+1:size(mat, 1)
+            mat[j, i] = -Inf
+        end
+    end
+    return (; 
+        triangular_matrix=mat,
+        key_net=Lux.initialstates(rng, m.key_net),
+        query_net=Lux.initialstates(rng, m.query_net),
+        value_net=Lux.initialstates(rng, m.value_net),
+        dropout=Lux.initialstates(rng, m.dropout),
+    )
+end
+Lux.parameterlength(m::Head) = Lux.parameterlength(m.key_net) + Lux.parameterlength(m.query_net) + Lux.parameterlength(m.value_net) + Lux.parameterlength(m.dropout)
+Lux.statelength(m::Head) = m.block_size^2 + Lux.statelength(m.key_net) + Lux.statelength(m.query_net) + Lux.statelength(m.value_net) + Lux.statelength(m.dropout)
 
 function (h::Head)(x::AbstractArray, ps, st::NamedTuple)
     C, T, B = size(x)
@@ -101,13 +118,13 @@ function (h::Head)(x::AbstractArray, ps, st::NamedTuple)
 
     wei = batched_mul(permutedims(yk, (2, 1, 3)), yq) .* sqrt(size(x, 1))
 
-    wei = wei .+ @view h.triangular_matrix[1:T, 1:T] # TODO this does not seem optimal?
+    wei = wei .+ @view st.triangular_matrix[1:T, 1:T] # TODO this does not seem optimal?
     wei = softmax(wei, dims=1)
     wei, sd = h.dropout(wei, ps.dropout, st.dropout)
 
     out = batched_mul(yv, wei)
 
-    return out, (key_net = sk, query_net = sq, value_net=sv, dropout=sd)
+    return out, (key_net = sk, query_net = sq, value_net=sv, dropout=sd, triangular_matrix=st.triangular_matrix)
 end
 
 model = Head(n_embd, n_embd, block_size, dropout)
