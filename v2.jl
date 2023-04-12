@@ -33,13 +33,15 @@ max_iters = 5000
 
 batch_size = 64
 block_size = 256
-n_embd = 384
+n_embd = 384 # To run on cpu decrease this
 n_head = 6
-n_layer = 6
+n_layer = 6 # To run on cpu decrease this
 
 lr = 3e-4
 dropout = 0.2
 
+# Set to cpu/gpu depending on use
+device(x) = cpu(x)
 
 function get_batch(rng, data; block_size, batch_size, vocab_size)
     ix = rand(rng, 1:length(data)-block_size, batch_size)
@@ -48,7 +50,7 @@ function get_batch(rng, data; block_size, batch_size, vocab_size)
     x, y
 end
 
-xb, yb = get_batch(rng, train_data; batch_size, block_size, vocab_size)
+xb, yb = get_batch(rng, train_data; batch_size, block_size, vocab_size) .|> device
 
 # Custom Layernorm since Lux one requires set size of non-batch dimensions (and we want to allow shorter)
 struct MyLayerNorm{T, D} <: Lux.AbstractNormalizationLayer{false, false}
@@ -128,9 +130,9 @@ function (h::Head)(x::AbstractArray, ps, st::NamedTuple)
 end
 
 model = Head(n_embd, n_embd, block_size, dropout)
-ps, st = Lux.setup(rng, model)
+ps, st = Lux.setup(rng, model) .|> device
 
-y, st = model(randn(rng, n_embd, block_size, batch_size), ps, st)
+y, st = model(randn(rng, n_embd, block_size, batch_size) |> device, ps, st)
 size(y)
 
 struct MultiHeadAttention{H,D,L} <: Lux.AbstractExplicitLayer
@@ -228,9 +230,9 @@ function (bl::BigramLanguageModel)(x::AbstractArray, ps, st::NamedTuple)
 end
 
 model = BigramLanguageModel(n_embd, vocab_size, block_size, dropout, n_head, n_layer)
-ps, st = Lux.setup(rng, model)
+ps, st = Lux.setup(rng, model) .|> device
 
-model(rand(rng, 1:vocab_size, block_size, batch_size), ps, st)
+model(xb, ps, st)
 
 function logitcrossentropy(ypred, ytrue; dims=1)
     return mean(.-sum(ytrue .* Lux.logsoftmax(ypred; dims=dims); dims=dims))
@@ -257,7 +259,7 @@ function generate(rng, x, model, ps, st; new_tokens, block_size)
 end
 
 # TODO should probably allow being called with shorter x?
-generated = generate(rng, ones(Int, 1, 1), model, ps, st; new_tokens=100, block_size)[:, 1]
+generated = generate(rng, ones(Int, 1, 1) |> device, model, ps, st; new_tokens=100, block_size)[:, 1]
 decoded = decode(generated)
 
 opt = Optimisers.ADAMW(lr)
