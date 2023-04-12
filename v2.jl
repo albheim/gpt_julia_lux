@@ -33,7 +33,7 @@ max_iters = 5000
 
 batch_size = 64
 block_size = 256
-n_embd = 384 # To run on cpu decrease this
+n_embd = 384 # To run on cpu decrease this, must be multiple of n_head
 n_head = 6
 n_layer = 6 # To run on cpu decrease this
 
